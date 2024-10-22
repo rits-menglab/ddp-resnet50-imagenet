@@ -1,0 +1,12 @@
+[project]
+name = "ddp-resnet50-imagenet"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.9.2",
+    "torch>=2.5.0",
+    "torcheval>=0.0.7",
+    "torchvision>=0.20.0",
+]
