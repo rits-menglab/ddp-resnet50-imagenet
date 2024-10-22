@@ -156,7 +156,7 @@ def main() -> None:
     test_loss = []
     test_acc = []
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.004)
     criterion = criterion.cuda()
 
     # マルチプロセス初期化
