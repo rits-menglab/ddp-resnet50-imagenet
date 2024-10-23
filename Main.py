@@ -1,11 +1,13 @@
 import codecs
-import time
 import logging
+import os
+import time
 from logging import DEBUG, INFO, StreamHandler, getLogger
 
 import matplotlib.pyplot as plt
 import torch
 import torch.distributed as dist
+from timm.scheduler import CosineLRScheduler
 from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
@@ -59,14 +61,18 @@ def train(
     train_loader: DataLoader,
     criterion: nn.CrossEntropyLoss,
     optimizer: optim.SGD,
+    scheduler: CosineLRScheduler,
     metric: MulticlassAccuracy,
+    num_steps_per_epoch: int,
+    epoch: int,
 ) -> float:
     count = 0
     train_loss = 0.0
     train_correct = 0.0
 
     ddp_model.train()
-    for _batch_idx, (data, label) in enumerate(train_loader):
+    for batch_idx, (data, label) in enumerate(train_loader):
+        num_updates = num_steps_per_epoch * epoch + batch_idx
         count += len(label)
         data_device, label_device = data.to(device_id), label.to(device_id)
         optimizer.zero_grad()
@@ -83,6 +89,7 @@ def train(
         metric.update(preds, label_device)
         loss.backward()
         optimizer.step()
+        scheduler.step_update(num_updates=num_updates)
 
     # lossの平均値
     train_loss = train_loss / count
@@ -106,6 +113,7 @@ def learning(
     test_loader: DataLoader,
     criterion: nn.CrossEntropyLoss,
     optimizer: optim.SGD,
+    scheduler: CosineLRScheduler,
     epochs: int,
 ) -> list:
     train_loss_list = []
@@ -118,22 +126,32 @@ def learning(
     torch.cuda.set_device(device)
     metric = MulticlassAccuracy(device=device)
 
+    num_steps_per_epoch = len(train_loader)
+
     for epoch in range(1, epochs + 1, 1):
         train_loss, train_acc = train(
-            ddp_model, rank, device_id, train_loader, criterion, optimizer, metric
-        )
-        test_loss, test_acc = test(
-            ddp_model, rank, device_id, test_loader, criterion, metric
-        )
-        # エポック毎の表示
-        logger.info(
-            "epoch : %d, train_loss : %f, train_acc : %f, test_loss : %f, test_acc : %f,",
+            ddp_model,
+            rank,
+            device_id,
+            train_loader,
+            criterion,
+            optimizer,
+            scheduler,
+            metric,
+            num_steps_per_epoch,
             epoch,
-            train_loss,
-            train_acc,
-            test_loss,
-            test_acc,
         )
+        test_loss, test_acc = test(ddp_model, rank, device_id, test_loader, criterion, metric)
+        # エポック毎の表示
+        if rank == 0:
+            logger.info(
+                "epoch : %d, train_loss : %f, train_acc : %f, test_loss : %f, test_acc : %f,",
+                epoch,
+                train_loss,
+                train_acc,
+                test_loss,
+                test_acc,
+            )
         train_loss_list.append(train_loss)
         train_acc_list.append(train_acc)
         test_loss_list.append(test_loss)
@@ -148,16 +166,13 @@ def main() -> None:
 
     # 変数もろもろ
     # batch_sizeの認識がずれてて datasetの総数//batch_sizeしたものが実際のbatch sizeになってる 50000//100=500的な感じ
-    batch_size = 512
-    epoch = 200
+    batch_size = 250
+    epoch = 90
 
     train_loss = []
     train_acc = []
     test_loss = []
     test_acc = []
-
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.004)
-    criterion = criterion.cuda()
 
     # マルチプロセス初期化
     dist.init_process_group("nccl")
@@ -179,7 +194,7 @@ def main() -> None:
     # 最後の全結合層の出力を100にすることでImageNet-100に対応させる
     model.fc = nn.Linear(in_features=512, out_features=100)
 
-    model = model.to(device_id)
+    model = model.cuda(device_id)
     ddp_model = DistributedDataParallel(model, device_ids=[device_id])
 
     # ImageNet-1K関連
@@ -199,14 +214,8 @@ def main() -> None:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ],
     )
-    train_dataset = ImageFolder(
-        "~/Documents/dataset/imagenet-100/train", transform=train_transform
-    )
-    test_dataset = ImageFolder(
-        "~/Documents/dataset/imagenet-100/val", transform=test_transform
-    )
-    # train_dataset = datasets.CIFAR10("./pv/data", train=True, download=True, transform=transform)
-    # test_dataset = datasets.CIFAR10("./pv/data", train=False, transform=transform)
+    train_dataset = ImageFolder("/usr/home/ihpc_double/dataset/imagenet-100/train", transform=train_transform)
+    test_dataset = ImageFolder("/usr/home/ihpc_double/dataset/imagenet-100/train", transform=test_transform)
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset,
         num_replicas=world_size,
@@ -218,25 +227,41 @@ def main() -> None:
         batch_size=batch_size,
         shuffle=train_sampler is None,
         sampler=train_sampler,
+        pin_memory=True,
+        num_workers=int(os.cpu_count() / world_size),
+        presist_workers=True,
     )
     test_sampler = torch.utils.data.distributed.DistributedSampler(
         test_dataset,
         num_replicas=world_size,
         rank=rank,
-        shuffle=True,
+        shuffle=False,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=test_sampler is None,
         sampler=test_sampler,
+        pin_memory=True,
     )
+
+    # 損失関数
+    # ラベルスムージング ref. https://qiita.com/wing_man/items/a1d5ab1bba7d763d9369#%E5%AE%9F%E9%A8%931%E3%81%AE%E7%B5%90%E6%9E%9C%E3%81%A8%E8%80%83%E5%AF%9F
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.004)
+    criterion = criterion.to(device_id)
 
     # オプティマイザ
     # 比較的精度が出やすい感じのチューンになっている
     # ref. https://qiita.com/TrashBoxx/items/2d441e46643f73c0ca19#3-1cifar-10%E3%82%92%E5%AD%A6%E7%BF%92%E3%81%99%E3%82%8B%E3%82%AF%E3%83%A9%E3%82%B9
-    optimizer = optim.SGD(
-        ddp_model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4, nesterov=True
+    optimizer = optim.SGD(ddp_model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4, nesterov=True)
+
+    scheduler = CosineLRScheduler(
+        optimizer,
+        t_initial=epoch,
+        lr_min=1e-4,
+        warmup_t=10,
+        warmup_lr_init=5e-5,
+        warmup_prefix=True,
     )
 
     # トレーニング
@@ -248,6 +273,7 @@ def main() -> None:
         test_loader=test_loader,
         criterion=criterion,
         optimizer=optimizer,
+        scheduler=scheduler,
         epochs=epoch,
     )
 
@@ -263,7 +289,7 @@ def main() -> None:
             time.time() - start,
             file=codecs.open("./pv/time.txt", "w", "utf-8"),
         )
-        torch.save(ddp_model.state_dict(), checkpoint_dir)
+        torch.save(ddp_model.module.state_dict(), checkpoint_dir)
 
         # lossのグラフ描画
         rate = plt.figure()
